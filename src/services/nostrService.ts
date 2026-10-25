@@ -7,6 +7,7 @@ import type { Filter as NostrFilter } from 'nostr-tools/filter'
 import { finalizeEvent, validateEvent, getEventHash } from 'nostr-tools/pure'
 import { normalizeURL } from 'nostr-tools/utils'
 import { encrypt, decrypt } from 'nostr-tools/nip04'
+import { getConversationKey, encrypt as encryptV2, decrypt as decryptV2 } from 'nostr-tools/nip44'
 import { wrapEvent, unwrapEvent, createRumor, createSeal, createWrap } from 'nostr-tools/nip59'
 import { neventEncode as nostrNeventEncode, naddrEncode as nostrNaddrEncode, npubEncode, decode as nip19Decode, nprofileEncode } from 'nostr-tools/nip19'
 import {SimplePool} from 'nostr-tools/pool'
@@ -232,6 +233,53 @@ const decryptNip04 = async function(
     const decryptedContent = await decrypt(keys.privateKey, senderPubKey, encryptedContent)
 
     log.trace('[decryptNip04]', {decryptedContent})
+
+    return decryptedContent
+}
+
+
+// The conversation key costs an ECDH and an HKDF and depends only on the key pair,
+// so a burst of NWC requests from one client derives it once. Peers are few (NWC
+// connections, contacts); the cap only guards against unbounded growth.
+const MAX_CONVERSATION_KEYS = 100
+const _conversationKeys = new Map<string, Uint8Array>()
+
+const getNip44ConversationKey = function (privateKey: string, publicKey: string): Uint8Array {
+    const cacheKey = `${privateKey}:${publicKey}`
+    let conversationKey = _conversationKeys.get(cacheKey)
+
+    if (!conversationKey) {
+        conversationKey = getConversationKey(hexToBytes(privateKey), publicKey)
+
+        if (_conversationKeys.size >= MAX_CONVERSATION_KEYS) {
+            _conversationKeys.clear()
+        }
+        _conversationKeys.set(cacheKey, conversationKey)
+    }
+
+    return conversationKey
+}
+
+
+const encryptNip44 = async function (
+    receiverPubkey: string,
+    content: string,
+    keys: NostrKeyPair
+): Promise<string> {
+    const conversationKey = getNip44ConversationKey(keys.privateKey, receiverPubkey)
+    return encryptV2(content, conversationKey)
+}
+
+
+const decryptNip44 = async function (
+    senderPubKey: string,
+    encryptedContent: string,
+    keys: NostrKeyPair
+): Promise<string> {
+    const conversationKey = getNip44ConversationKey(keys.privateKey, senderPubKey)
+    const decryptedContent = decryptV2(encryptedContent, conversationKey)
+
+    log.trace('[decryptNip44]', {decryptedContent})
 
     return decryptedContent
 }
@@ -725,6 +773,9 @@ export const NostrClient = { // TODO split helper functions to separate module
     // maybeConvertNpub,
     encryptNip04,
     decryptNip04,
+    getNip44ConversationKey,
+    encryptNip44,
+    decryptNip44,
     encryptAndSendDirectMessageNip17,
     decryptDirectMessageNip17,
     createDirectMessageNip17,
