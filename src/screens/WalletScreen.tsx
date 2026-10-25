@@ -222,6 +222,9 @@ export const WalletScreen = observer(function WalletScreen({ route }: Props) {
             // go through websockets only if remote notifications not working as push data messages are
             // delivered even if notifications are disabled on device                        
             if(!walletProfileStore.device) {nwcStore.listenForNwcEvents()}
+
+            // Connections created before NIP-44 support advertise nip04 only until this republishes
+            if(nwcStore.all.length > 0) {nwcStore.ensureInfoEvent()}
             // if(__DEV__) NotificationService.createNwcListenerNotification()
         }
 

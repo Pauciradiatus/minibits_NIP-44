@@ -29,6 +29,14 @@ import EventEmitter from '../utils/eventEmitter'
 import { addSeconds } from 'date-fns/addSeconds'
 import { Transaction, TransactionStatus } from './Transaction'
 import { getVerifiedZapRequest, toNwcTransaction, toNwcTransactionQuery } from './NwcTransaction'
+import {
+    getInfoEventTags,
+    getRequestEncryption,
+    getResponseEncryption,
+    isInfoEventCurrent,
+    NwcEncryption,
+    SUPPORTED_NWC_ENCRYPTIONS,
+} from './NwcEncryption'
 import { MeltQuoteBolt11Response } from '@cashu/cashu-ts'
 import { WalletStore } from './WalletStore'
 import { ProofsStore } from './ProofsStore'
@@ -83,6 +91,18 @@ const getConnectionRelays = function () {
     // const publicRelays = NostrClient.getDefaultRelays() 
     // return [...minibitsRelays, ...publicRelays]
     return minibitsRelays
+}
+
+const encryptNwcContent = function (encryption: NwcEncryption, receiverPubkey: string, content: string, keys: NostrKeyPair) {
+    return encryption === NwcEncryption.NIP44_V2
+        ? NostrClient.encryptNip44(receiverPubkey, content, keys)
+        : NostrClient.encryptNip04(receiverPubkey, content, keys)
+}
+
+const decryptNwcContent = function (encryption: NwcEncryption, senderPubkey: string, content: string, keys: NostrKeyPair) {
+    return encryption === NwcEncryption.NIP44_V2
+        ? NostrClient.decryptNip44(senderPubkey, content, keys)
+        : NostrClient.decryptNip04(senderPubkey, content, keys)
 }
 
 export const LISTEN_FOR_NWC_EVENTS = 'listenForNwcEvents'
@@ -224,7 +244,8 @@ export const NwcConnectionModel = types.model('NwcConnection', {
         const walletStore = self.getWalletStore()
         const keys: NostrKeyPair = (yield walletStore.getCachedWalletKeys()).NOSTR
 
-        const encryptedContent = yield NostrClient.encryptNip04(
+        const encryptedContent = yield encryptNwcContent(
+            getResponseEncryption(requestEvent.tags),
             requestEvent.pubkey,
             JSON.stringify(nwcResponse),
             keys
@@ -618,10 +639,29 @@ export const NwcConnectionModel = types.model('NwcConnection', {
     handleNwcRequestTask: flow(function* handleNwcRequestTask(requestEvent: NostrEvent, decryptedNwcRequest?: NwcRequest) {
         let nwcRequest: NwcRequest
         if(!decryptedNwcRequest) {
+            const encryption = getRequestEncryption(requestEvent.tags)
+
+            if(!encryption) {
+                // The method is inside the content we cannot read, hence no result_type.
+                const scheme = NostrClient.getFirstTagValue(requestEvent.tags, 'encryption')
+                const nwcError: NwcError = {
+                    result_type: '',
+                    error: {
+                        code: 'UNSUPPORTED_ENCRYPTION',
+                        message: `Encryption ${scheme} is not supported, use one of: ${SUPPORTED_NWC_ENCRYPTIONS.join(', ')}.`
+                    }
+                }
+
+                log.warn('[Nwc.handleRequest] Unsupported encryption', {scheme, connection: self.name})
+                yield self.sendResponse(nwcError, requestEvent)
+                return nwcError
+            }
+
             const walletStore = self.getWalletStore()
             const keys: NostrKeyPair = (yield walletStore.getCachedWalletKeys()).NOSTR
 
-            const decryptedContent = yield NostrClient.decryptNip04(
+            const decryptedContent = yield decryptNwcContent(
+                encryption,
                 requestEvent.pubkey,
                 requestEvent.content,
                 keys
@@ -750,7 +790,43 @@ export const NwcStoreModel = types
         },
         setRetrieveEventsSince (since: number) {
             self.retrieveEventsSince = since
-        }
+        },
+        /**
+         * Publishes the NIP-47 info event (replaceable kind 13194) unless the relays
+         * already have the current one. Clients read its encryption tag to choose
+         * nip44, so an event published before NIP-44 support, or none at all, keeps
+         * every connection on nip04. One info event covers all connections, as they
+         * share the wallet pubkey.
+         */
+        ensureInfoEvent: flow(function* ensureInfoEvent(): Generator<Promise<any>, void, any> {
+            try {
+                const filter = {
+                    kinds: [NWCWalletInfo],
+                    authors: [self.walletPubkey],
+                }
+
+                const existingInfoEvent = yield NostrClient.getEvent(self.connectionRelays, filter)
+
+                if(isInfoEventCurrent(existingInfoEvent, self.supportedMethods)) {
+                    return
+                }
+
+                const infoEvent: NostrUnsignedEvent = {
+                    kind: NWCWalletInfo,
+                    pubkey: self.walletPubkey,
+                    tags: getInfoEventTags(),
+                    content: self.supportedMethods.join(' '),
+                    created_at: Math.floor(Date.now() / 1000)
+                }
+
+                const keys: NostrKeyPair = (yield getRootStore(self).walletStore.getCachedWalletKeys()).NOSTR
+
+                yield NostrClient.publish(infoEvent, self.connectionRelays, keys, false)
+                log.debug('[ensureInfoEvent] Published NWC info event', {tags: infoEvent.tags})
+            } catch (e: any) {
+                log.warn('[ensureInfoEvent] Could not publish NWC info event', {message: e.message})
+            }
+        }),
     }))
     .actions(self => ({
         addConnection: flow(function* addConnection(name: string, dailyLimit: number) {
@@ -770,37 +846,9 @@ export const NwcStoreModel = types
 
             self.nwcConnections.push(newConnection)
 
-            const filter = {            
-                kinds: [NWCWalletInfo],
-                authors: [newConnection.walletPubkey],                
-            }
-
-            // Not sure we should publish that as we are not always on, TBD
-            const existingInfoEvent = yield NostrClient.getEvent(newConnection.connectionRelays, filter)
-
-            if(!existingInfoEvent) {
-                // publish info replacable event // seems to be a relict replaced by get_info request?
-                const infoEvent: NostrUnsignedEvent = {
-                    kind: NWCWalletInfo,
-                    pubkey: newConnection.walletPubkey,
-                    tags: [],
-                    content: self.supportedMethods.join(' '),
-                    created_at: Math.floor(Date.now() / 1000)
-                }
-
-                // Fire and forget - publish without waiting
-                ;(async () => {
-                    const rootStore = getRootStore(self)
-                    const keys: NostrKeyPair = (await rootStore.walletStore.getCachedWalletKeys()).NOSTR
-                    NostrClient.publish(
-                        infoEvent,
-                        newConnection.connectionRelays,
-                        keys,
-                        false
-                    )
-                })()
-            }
-        }),        
+            // Fire and forget - the connection works without it, clients just fall back to nip04
+            self.ensureInfoEvent()
+        }),
         removeConnection(connectionToRemove: NwcConnection) {
             let connInstance: NwcConnection | undefined            
 
